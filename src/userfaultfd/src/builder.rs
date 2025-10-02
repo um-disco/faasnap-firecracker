@@ -100,8 +100,8 @@ impl UffdBuilder {
         unsafe {
             raw::api(fd, &mut api as *mut raw::uffdio_api)?;
         }
-        let supported =
-            IoctlFlags::from_bits(api.ioctls).ok_or(Error::UnrecognizedIoctls(api.ioctls))?;
+        // Use from_bits_truncate to ignore unknown bits (e.g., Canvas's SWAP_PREFETCH)
+        let supported = IoctlFlags::from_bits_truncate(api.ioctls);
         if !supported.contains(self.req_ioctls) {
             Err(Error::UnsupportedIoctls(supported))
         } else {

@@ -76,7 +76,8 @@ impl Uffd {
         unsafe {
             raw::register(self.as_raw_fd(), &mut register as *mut raw::uffdio_register)?;
         }
-        IoctlFlags::from_bits(register.ioctls).ok_or(Error::UnrecognizedIoctls(register.ioctls))
+        // Use from_bits_truncate to ignore unknown bits (e.g., Canvas's SWAP_PREFETCH)
+        Ok(IoctlFlags::from_bits_truncate(register.ioctls))
     }
 
     /// Unregister a memory address range from the userfaultfd object.

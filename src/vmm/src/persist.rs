@@ -6,19 +6,17 @@
 // Currently only supports x86_64.
 #![cfg(target_arch = "x86_64")]
 
-use std::fmt::{Display, Formatter};
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::unix::prelude::AsRawFd;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use libc::posix_fadvise;
-use libc::POSIX_FADV_RANDOM;
 use crate::builder::{self, StartMicrovmError};
 use crate::device_manager::persist::Error as DevicePersistError;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vstate::{self, VcpuState, VmState};
+use logger::{info, warn};
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::device_manager::persist::DeviceStates;
 use crate::memory_snapshot;
@@ -258,12 +256,27 @@ pub fn load_snapshot(
     use self::LoadSnapshotError::*;
     let track_dirty = params.enable_diff_snapshots;
     let microvm_state = snapshot_state_from_file(&params.snapshot_path, version_map)?;
-    let guest_memory = guest_memory_from_file(&params.mem_file_path, &microvm_state.memory_state, params.enable_user_page_faults, &params.overlay_file_path, &params.overlay_regions, &params.ws_file_path, &params.ws_regions, params.load_ws, &params.fadvise)?;
+    let guest_memory = guest_memory_from_file(
+        &params.mem_file_path,
+        &microvm_state.memory_state,
+        params.enable_user_page_faults,
+        &params.overlay_file_path,
+        &params.overlay_regions,
+        &params.ws_file_path,
+        &params.ws_regions,
+        params.load_ws,
+        &params.fadvise,
+        &params.pseudo_mm_template_path,
+    )?;
     if params.enable_user_page_faults == true {
-        guest_memory.register_for_upf(&params.sock_file_path).map_err(UserPageFault)?;
+        guest_memory
+            .register_for_upf(&params.sock_file_path)
+            .map_err(UserPageFault)?;
     }
     if params.load_ws {
-        guest_memory.load_working_set(&params.ws_regions);
+        guest_memory
+            .load_working_set(&params.ws_regions)
+            .map_err(DeserializeMemory)?;
     }
     builder::build_microvm_from_snapshot(
         event_manager,
@@ -295,9 +308,40 @@ fn guest_memory_from_file(
     ws_regions: &Vec<Vec<i64>>,
     load_ws: bool,
     fadvise: &String,
+    pseudo_mm_template_path: &PathBuf,
 ) -> std::result::Result<GuestMemoryMmap, LoadSnapshotError> {
-    use self::LoadSnapshotError::{DeserializeMemory, MemoryBackingFile};
-    GuestMemoryMmap::restore(mem_file_path, mem_state, enable_user_page_faults, overlay_file_path, overlay_regions, ws_file_path, ws_regions, load_ws, fadvise).map_err(DeserializeMemory)
+    use self::LoadSnapshotError::DeserializeMemory;
+
+    // Check if pseudo_mm restore should be used
+    if !pseudo_mm_template_path.as_os_str().is_empty() {
+        info!(
+            "Attempting pseudo_mm fast restore from template {:?}",
+            pseudo_mm_template_path
+        );
+        match GuestMemoryMmap::restore_with_pseudo_mm(pseudo_mm_template_path) {
+            Ok(memory) => return Ok(memory),
+            Err(err) => {
+                warn!(
+                    "pseudo_mm restore failed ({}); falling back to memfile restore",
+                    err
+                );
+            }
+        }
+    }
+
+    // Fall back to traditional restore
+    GuestMemoryMmap::restore(
+        mem_file_path,
+        mem_state,
+        enable_user_page_faults,
+        overlay_file_path,
+        overlay_regions,
+        ws_file_path,
+        ws_regions,
+        load_ws,
+        fadvise,
+    )
+    .map_err(DeserializeMemory)
     // if overlay_regions.is_empty()  { // vanilla
     //     let memfile = File::open(mem_file_path).map_err(MemoryBackingFile)?;
     //     GuestMemoryMmap::restore(&memfile, mem_state, enable_user_page_faults, overlay_regions, ws_regions, load_ws).map_err(DeserializeMemory)
@@ -308,7 +352,7 @@ fn guest_memory_from_file(
     //     GuestMemoryMmap::restore(&wsfile, mem_state, enable_user_page_faults, overlay_regions, ws_regions, load_ws).map_err(DeserializeMemory)
     // } else { // use both memfile and wsfile
     //     let memfile = File::open(mem_file_path).map_err(MemoryBackingFile)?;
-    //     let wsfile = File::open(ws_file).map_err(MemoryBackingFile)?;    
+    //     let wsfile = File::open(ws_file).map_err(MemoryBackingFile)?;
     //     GuestMemoryMmap::restore2(&memfile, &wsfile, mem_state, enable_user_page_faults, overlay_regions, groups, load_ws).map_err(DeserializeMemory)
     // }
 }

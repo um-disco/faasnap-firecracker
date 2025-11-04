@@ -61,13 +61,16 @@ pub struct LoadSnapshotParams {
     pub overlay_regions: HashMap<i64, i64>,
     /// ws file path
     pub ws_file_path: PathBuf,
-    /// ws file mappings: 
+    /// ws file mappings:
     pub ws_regions: Vec<Vec<i64>>,
     /// enable locally load ws
     pub load_ws: bool,
     #[serde(default)]
     /// fadvise for memfile
     pub fadvise: String,
+    /// Optional path to pseudo_mm template for RDMA-backed fast restore
+    #[serde(default)]
+    pub pseudo_mm_template_path: PathBuf,
 }
 
 /// The microVM state options.

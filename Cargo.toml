@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/firecracker", "src/jailer"]
+members = ["src/firecracker", "src/jailer", "tools/pseudo_mm_template_creator"]
 
 [profile.dev]
 panic = "abort"
@@ -7,3 +7,6 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = true
+
+[patch.crates-io]
+vm-memory = { path = "vm-memory" }

@@ -11,8 +11,8 @@
 #![deny(missing_docs)]
 
 // crates for userfaultfd
-extern crate userfaultfd;
 extern crate passfd;
+extern crate userfaultfd;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
@@ -22,6 +22,10 @@ pub(crate) mod device_manager;
 pub mod memory_snapshot;
 /// Save/restore utilities.
 pub mod persist;
+/// Pseudo_MM restore module.
+pub mod pseudo_mm_restore;
+/// Pseudo_MM support for fast memory restoration.
+pub mod pseudo_mm_support;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// microVM RPC API adapters.

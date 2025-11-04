@@ -1,0 +1,290 @@
+From 6eb4fec0468dd6b595eebe1108f3958ca730ee6f Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Thu, 14 May 2020 16:08:57 +0200
+Subject: [PATCH] bytes: avoid torn writes with memcpy
+
+Some memcpy implementations are copying bytes one at a time, which
+is slow and also breaks the virtio specification by splitting writes
+to the fields of the virtio descriptor. So, reimplement memcpy in Rust
+and copy in larger pieces, according to the largest possible alignment
+allowed by the pointer values.
+
+Signed-off-by: Serban Iorga <seriorga@amazon.com>
+Signed-off-by: Andreea Florescu <fandree@amazon.com>
+Signed-off-by: Alexandru Agache <aagch@amazon.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+---
+ src/guest_memory.rs    | 125 +++++++++++++++++++++++++++++++++++++++++
+ src/volatile_memory.rs |  90 ++++++++++++++++++++++++-----
+ 2 files changed, 200 insertions(+), 15 deletions(-)
+
+diff --git a/src/guest_memory.rs b/src/guest_memory.rs
+index b39fa87..19de1a6 100644
+--- a/src/guest_memory.rs
++++ b/src/guest_memory.rs
+@@ -864,9 +864,14 @@ impl<T: GuestMemory> Bytes<GuestAddress> for T {
+ mod tests {
+     use super::*;
+     #[cfg(feature = "backend-mmap")]
++    use crate::bytes::ByteValued;
++    #[cfg(feature = "backend-mmap")]
+     use crate::{GuestAddress, GuestMemoryMmap};
+     #[cfg(feature = "backend-mmap")]
+     use std::io::Cursor;
++    #[cfg(feature = "backend-mmap")]
++    use std::time::{Duration, Instant};
++
+     use vmm_sys_util::tempfile::TempFile;
+ 
+     #[cfg(feature = "backend-mmap")]
+@@ -905,4 +910,124 @@ mod tests {
+                 .unwrap()
+         );
+     }
++
++    // Runs the provided closure in a loop, until at least `duration` time units have elapsed.
++    #[cfg(feature = "backend-mmap")]
++    fn loop_timed<F>(duration: Duration, mut f: F)
++    where
++        F: FnMut() -> (),
++    {
++        // We check the time every `CHECK_PERIOD` iterations.
++        const CHECK_PERIOD: u64 = 1_000_000;
++        let start_time = Instant::now();
++
++        loop {
++            for _ in 0..CHECK_PERIOD {
++                f();
++            }
++            if start_time.elapsed() >= duration {
++                break;
++            }
++        }
++    }
++
++    // Helper method for the following test. It spawns a writer and a reader thread, which
++    // simultaneously try to access an object that is placed at the junction of two memory regions.
++    // The part of the object that's continuously accessed is a member of type T. The writer
++    // flips all the bits of the member with every write, while the reader checks that every byte
++    // has the same value (and thus it did not do a non-atomic access). The test succeeds if
++    // no mismatch is detected after performing accesses for a pre-determined amount of time.
++    #[cfg(feature = "backend-mmap")]
++    fn non_atomic_access_helper<T>()
++    where
++        T: ByteValued
++            + std::fmt::Debug
++            + From<u8>
++            + Into<u128>
++            + std::ops::Not<Output = T>
++            + PartialEq,
++    {
++        use std::mem;
++        use std::thread;
++
++        // A dummy type that's always going to have the same alignment as the first member,
++        // and then adds some bytes at the end.
++        #[derive(Clone, Copy, Debug, Default, PartialEq)]
++        struct Data<T> {
++            val: T,
++            some_bytes: [u8; 7],
++        }
++
++        // Some sanity checks.
++        assert_eq!(mem::align_of::<T>(), mem::align_of::<Data<T>>());
++        assert_eq!(mem::size_of::<T>(), mem::align_of::<T>());
++
++        unsafe impl<T: ByteValued> ByteValued for Data<T> {}
++
++        // Start of first guest memory region.
++        let start = GuestAddress(0);
++        let region_len = 1 << 12;
++
++        // The address where we start writing/reading a Data<T> value.
++        let data_start = GuestAddress((region_len - mem::size_of::<T>()) as u64);
++
++        let mem = GuestMemoryMmap::from_ranges(&[
++            (start, region_len),
++            (start.unchecked_add(region_len as u64), region_len),
++        ])
++        .unwrap();
++
++        // Need to clone this and move it into the new thread we create.
++        let mem2 = mem.clone();
++        // Just some bytes.
++        let some_bytes = [1u8, 2, 4, 16, 32, 64, 128];
++
++        let mut data = Data {
++            val: T::from(0u8),
++            some_bytes,
++        };
++
++        // Simple check that cross-region write/read is ok.
++        mem.write_obj(data, data_start).unwrap();
++        let read_data = mem.read_obj::<Data<T>>(data_start).unwrap();
++        assert_eq!(read_data, data);
++
++        let t = thread::spawn(move || {
++            let mut count: u64 = 0;
++
++            loop_timed(Duration::from_secs(3), || {
++                let data = mem2.read_obj::<Data<T>>(data_start).unwrap();
++
++                // Every time data is written to memory by the other thread, the value of
++                // data.val alternates between 0 and T::MAX, so the inner bytes should always
++                // have the same value. If they don't match, it means we read a partial value,
++                // so the access was not atomic.
++                let bytes = data.val.into().to_le_bytes();
++                for i in 1..mem::size_of::<T>() {
++                    if bytes[0] != bytes[i] {
++                        panic!(
++                            "val bytes don't match {:?} after {} iterations",
++                            &bytes[..mem::size_of::<T>()],
++                            count
++                        );
++                    }
++                }
++                count += 1;
++            });
++        });
++
++        // Write the object while flipping the bits of data.val over and over again.
++        loop_timed(Duration::from_secs(3), || {
++            mem.write_obj(data, data_start).unwrap();
++            data.val = !data.val;
++        });
++
++        t.join().unwrap()
++    }
++
++    #[cfg(feature = "backend-mmap")]
++    #[test]
++    fn test_non_atomic_access() {
++        non_atomic_access_helper::<u16>()
++    }
+ }
+diff --git a/src/volatile_memory.rs b/src/volatile_memory.rs
+index 4d40bc6..d0a095d 100644
+--- a/src/volatile_memory.rs
++++ b/src/volatile_memory.rs
+@@ -463,6 +463,57 @@ impl<'a> VolatileSlice<'a> {
+     }
+ }
+ 
++// Return the largest value that `addr` is aligned to. Forcing this function to return 1 will
++// cause test_non_atomic_access to fail.
++fn alignment(addr: usize) -> usize {
++    // Rust is silly and does not let me write addr & -addr.
++    addr & (!addr + 1)
++}
++
++// Has the same safety requirements as `read_volatile` + `write_volatile`, namely:
++// - `src_addr` and `dst_addr` must be valid for reads/writes.
++// - `src_addr` and `dst_addr` must be properly aligned with respect to `align`.
++// - `src_addr` must point to a properly initialized value, which is true here because
++//   we're only using integer primitives.
++unsafe fn copy_single(align: usize, src_addr: usize, dst_addr: usize) {
++    match align {
++        8 => write_volatile(dst_addr as *mut u64, read_volatile(src_addr as *const u64)),
++        4 => write_volatile(dst_addr as *mut u32, read_volatile(src_addr as *const u32)),
++        2 => write_volatile(dst_addr as *mut u16, read_volatile(src_addr as *const u16)),
++        1 => write_volatile(dst_addr as *mut u8, read_volatile(src_addr as *const u8)),
++        _ => unreachable!(),
++    }
++}
++
++fn copy_slice(dst: &mut [u8], src: &[u8]) -> usize {
++    let total = min(src.len(), dst.len());
++    let mut left = total;
++
++    let mut src_addr = src.as_ptr() as usize;
++    let mut dst_addr = dst.as_ptr() as usize;
++    let align = min(alignment(src_addr), alignment(dst_addr));
++
++    let mut copy_aligned_slice = |min_align| {
++        while align >= min_align && left >= min_align {
++            // Safe because we check alignment beforehand, the memory areas are valid for
++            // reads/writes, and the source always contains a valid value.
++            unsafe { copy_single(min_align, src_addr, dst_addr) };
++            src_addr += min_align;
++            dst_addr += min_align;
++            left -= min_align;
++        }
++    };
++
++    if size_of::<usize>() > 4 {
++        copy_aligned_slice(8);
++    }
++    copy_aligned_slice(4);
++    copy_aligned_slice(2);
++    copy_aligned_slice(1);
++
++    total
++}
++
+ impl Bytes<usize> for VolatileSlice<'_> {
+     type E = Error;
+ 
+@@ -482,13 +533,12 @@ impl Bytes<usize> for VolatileSlice<'_> {
+         if addr >= self.size {
+             return Err(Error::OutOfBounds { addr });
+         }
+-        unsafe {
+-            // Guest memory can't strictly be modeled as a slice because it is
+-            // volatile.  Writing to it with what compiles down to a memcpy
+-            // won't hurt anything as long as we get the bounds checks right.
+-            let mut slice: &mut [u8] = &mut self.as_mut_slice()[addr..];
+-            slice.write(buf).map_err(Error::IOError)
+-        }
++
++        // Guest memory can't strictly be modeled as a slice because it is
++        // volatile.  Writing to it with what is essentially a fancy memcpy
++        // won't hurt anything as long as we get the bounds checks right.
++        let slice = unsafe { self.as_mut_slice() }.split_at_mut(addr).1;
++        Ok(copy_slice(slice, buf))
+     }
+ 
+     /// # Examples
+@@ -504,17 +554,16 @@ impl Bytes<usize> for VolatileSlice<'_> {
+     ///     assert!(res.is_ok());
+     ///     assert_eq!(res.unwrap(), 14);
+     /// ```
+-    fn read(&self, mut buf: &mut [u8], addr: usize) -> Result<usize> {
++    fn read(&self, buf: &mut [u8], addr: usize) -> Result<usize> {
+         if addr >= self.size {
+             return Err(Error::OutOfBounds { addr });
+         }
+-        unsafe {
+-            // Guest memory can't strictly be modeled as a slice because it is
+-            // volatile.  Writing to it with what compiles down to a memcpy
+-            // won't hurt anything as long as we get the bounds checks right.
+-            let slice: &[u8] = &self.as_slice()[addr..];
+-            buf.write(slice).map_err(Error::IOError)
+-        }
++
++        // Guest memory can't strictly be modeled as a slice because it is
++        // volatile.  Writing to it with what is essentially a fancy memcpy
++        // won't hurt anything as long as we get the bounds checks right.
++        let slice = unsafe { self.as_slice() }.split_at(addr).1;
++        Ok(copy_slice(buf, slice))
+     }
+ 
+     /// # Examples
+@@ -1560,4 +1609,15 @@ mod tests {
+             }
+         );
+     }
++
++    #[test]
++    fn alignment() {
++        let a = [0u8; 64];
++        let a = &a[a.as_ptr().align_offset(32)] as *const u8 as usize;
++        assert!(super::alignment(a) >= 32);
++        assert_eq!(super::alignment(a + 9), 1);
++        assert_eq!(super::alignment(a + 30), 2);
++        assert_eq!(super::alignment(a + 12), 4);
++        assert_eq!(super::alignment(a + 8), 8);
++    }
+ }
+-- 
+2.20.1 (Apple Git-117)
+

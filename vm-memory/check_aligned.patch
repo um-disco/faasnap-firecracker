@@ -1,0 +1,64 @@
+diff --git a/src/volatile_memory.rs b/src/volatile_memory.rs
+index 4d40bc6..407b42e 100644
+--- a/src/volatile_memory.rs
++++ b/src/volatile_memory.rs
+@@ -461,6 +461,24 @@ impl<'a> VolatileSlice<'a> {
+         }
+         Ok(())
+     }
++
++    /// Returns the maximum chunk size in bytes (up to 8) that can users can read/write
++    /// at the time from an object with `obj_len`.
++    ///
++    /// We are trying to read/write at the highest granularity. If everything else fails,
++    /// we fallback to 1 byte read/writes.
++    fn max_aligned_chunk_size(&self, obj_len_in_bytes: usize) -> usize {
++        let mut chunk_size_in_bytes: usize = 1;
++        let alignments = [8, 4, 2];
++        for obj_alignment in &alignments {
++            if obj_len_in_bytes % obj_alignment == 0 && self.check_alignment(*obj_alignment).is_ok() {
++                chunk_size_in_bytes = *obj_alignment;
++                break;
++            }
++        }
++
++        chunk_size_in_bytes
++    }
+ }
+ 
+ impl Bytes<usize> for VolatileSlice<'_> {
+@@ -482,12 +500,29 @@ impl Bytes<usize> for VolatileSlice<'_> {
+         if addr >= self.size {
+             return Err(Error::OutOfBounds { addr });
+         }
++        let mut chunk_size_in_bytes: usize = self.max_aligned_chunk_size(buf.len());
++
++        // Safe because we checked the alli
+         unsafe {
+-            // Guest memory can't strictly be modeled as a slice because it is
+-            // volatile.  Writing to it with what compiles down to a memcpy
+-            // won't hurt anything as long as we get the bounds checks right.
+-            let mut slice: &mut [u8] = &mut self.as_mut_slice()[addr..];
+-            slice.write(buf).map_err(Error::IOError)
++            match chunk_size_in_bytes {
++                8 => {
++                    let slice = self.as_mut_slice();
++                    slice.write(buf as &[u64]).map_err(Error::IOError)
++                },
++                4 => {
++                    let slice = self.as_mut_slice();
++                    slice.write(buf).map_err(Error::IOError)
++                },
++                2 => {
++                    let slice = self.as_mut_slice();
++                    slice.write(buf).map_err(Error::IOError)
++                }
++                1 => {
++                    let slice = self.as_mut_slice();
++                    slice.write(buf).map_err(Error::IOError)
++                },
++                _ => panic!("The impossible has happened. We tried to work with a chunk size that we didn't set.")
++            }
+         }
+     }
+ 
